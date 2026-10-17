@@ -68,10 +68,10 @@
 <script>
 // Service UUIDs to ask for. Web Bluetooth only exposes services listed here.
 const KNOWN = {
-  'generic_access': 'Generic Access',
-  'generic_attribute': 'Generic Attribute',
-  'device_information': 'Device Information',
-  'battery_service': 'Battery',
+  0x1800: 'Generic Access',
+  0x1801: 'Generic Attribute',
+  0x180a: 'Device Information',
+  0x180f: 'Battery',
   0x184e: 'LE Audio: Audio Stream Control',
   0x184f: 'LE Audio: Broadcast Audio Scan',
   0x1850: 'LE Audio: Published Audio Capabilities',
@@ -85,8 +85,20 @@ const KNOWN = {
   0xfd6c: 'Samsung (16-bit)',
   0xfe2c: 'Google Fast Pair',
   '2e73a4ad-332d-41fc-90e2-16bef06523f2': 'Samsung Buds control (SPP UUID, if mirrored on GATT)',
-  '0000fd69-0000-1000-8000-00805f9b34fb': 'Samsung (128-bit form)',
 };
+
+// Not requested: some browsers reject these in optionalServices.
+const SKIP_REQUEST = [0x1800, 0x1801];
+// Full lowercase 128-bit form; doesn't rely on BluetoothUUID (missing in some iOS browsers).
+const fullUuid = k => /^\d+$/.test(String(k))
+  ? `0000${Number(k).toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`
+  : String(k).toLowerCase();
+const KNOWN_FULL = Object.fromEntries(Object.entries(KNOWN).map(([k, v]) => [fullUuid(k), v]));
+// Bluefy can reject with non-Error values, so describe whatever we get.
+function describeErr(e) {
+  if (e && (e.name || e.message)) return `${e.name || 'Error'}: ${e.message || ''}`;
+  try { return `${typeof e}: ${JSON.stringify(e) ?? String(e)}`; } catch { return String(e); }
+}
 
 const $ = id => document.getElementById(id);
 const logEl = $('log'), servicesEl = $('services'), statusEl = $('status');
@@ -119,10 +131,30 @@ async function scan() {
     return;
   }
   const extra = $('extra').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-  const optionalServices = [...Object.keys(KNOWN).map(k => isNaN(k) ? k : Number(k)), ...extra];
+  const optionalServices = [...Object.keys(KNOWN).filter(k => !SKIP_REQUEST.includes(Number(k))).map(fullUuid), ...extra];
+  // Try the full UUID list first; if the browser rejects it, retry without it.
+  const attempts = [
+    { label: 'all devices + service list', opts: { acceptAllDevices: true, optionalServices } },
+    { label: 'all devices, no service list', opts: { acceptAllDevices: true } },
+  ];
+  device = null;
+  for (const a of attempts) {
+    try {
+      setStatus('choose device…');
+      log(`requestDevice (${a.label})`);
+      device = await navigator.bluetooth.requestDevice(a.opts);
+      break;
+    } catch (e) {
+      log('requestDevice failed: ' + describeErr(e));
+      if (e && e.name === 'NotFoundError' && /cancel/i.test(e.message || '')) break;
+    }
+  }
+  if (!device) {
+    setStatus('no device picked', 'bad');
+    log('Check: iPhone Settings → Bluefy → Bluetooth is ON, and Bluetooth is on in Control Center.');
+    return;
+  }
   try {
-    setStatus('choose device…');
-    device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices });
     log(`Picked: name="${device.name}" id=${device.id}`);
     device.addEventListener('gattserverdisconnected', () => { log('Disconnected'); setStatus('disconnected', 'bad'); $('disconnect').disabled = true; });
     setStatus('connecting…');
@@ -133,7 +165,7 @@ async function scan() {
     await explore(server, optionalServices);
   } catch (e) {
     setStatus('error', 'bad');
-    log('Error: ' + e.name + ': ' + e.message);
+    log('Error: ' + describeErr(e));
   }
 }
 
@@ -144,7 +176,7 @@ async function explore(server, wanted) {
     services = await server.getPrimaryServices();
     log(`getPrimaryServices(): ${services.length} service(s)`);
   } catch (e) {
-    log('getPrimaryServices() failed: ' + e.message + ' – trying each UUID');
+    log('getPrimaryServices() failed: ' + describeErr(e) + ' – trying each UUID');
   }
   if (!services.length) {
     for (const u of wanted) {
@@ -161,16 +193,14 @@ async function explore(server, wanted) {
 }
 
 async function renderService(svc) {
-  const name = Object.entries(KNOWN).find(([k]) => {
-    try { return BluetoothUUID.getService(isNaN(k) ? k : Number(k)) === svc.uuid; } catch { return false; }
-  })?.[1] || '';
+  const name = KNOWN_FULL[String(svc.uuid).toLowerCase()] || '';
   log(`Service ${svc.uuid} ${name}`);
   const box = document.createElement('div');
   box.className = 'svc';
   box.innerHTML = `<div><b>${name || 'Unknown service'}</b></div><div class="uuid">${svc.uuid}</div>`;
   servicesEl.appendChild(box);
   let chars = [];
-  try { chars = await svc.getCharacteristics(); } catch (e) { log('  getCharacteristics failed: ' + e.message); }
+  try { chars = await svc.getCharacteristics(); } catch (e) { log('  getCharacteristics failed: ' + describeErr(e)); }
   for (const c of chars) renderChar(box, c);
 }
 
@@ -186,7 +216,7 @@ function renderChar(box, c) {
   if (c.properties.read) {
     const b = button('Read', async () => show(await c.readValue(), 'read'));
     row.appendChild(b);
-    c.readValue().then(dv => show(dv, 'read')).catch(e => log(`  read ${c.uuid} failed: ${e.message}`));
+    c.readValue().then(dv => show(dv, 'read')).catch(e => log(`  read ${c.uuid} failed: ${describeErr(e)}`));
   }
   if (c.properties.notify || c.properties.indicate) {
     row.appendChild(button('Subscribe', async () => {
@@ -211,7 +241,7 @@ function renderChar(box, c) {
 function button(label, fn) {
   const b = document.createElement('button');
   b.textContent = label;
-  b.onclick = async () => { try { await fn(); } catch (e) { log(`  ${label} failed: ${e.message}`); } };
+  b.onclick = async () => { try { await fn(); } catch (e) { log(`  ${label} failed: ${describeErr(e)}`); } };
   return b;
 }
 

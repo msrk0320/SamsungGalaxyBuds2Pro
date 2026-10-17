@@ -8,6 +8,15 @@ Buds 2 Pro normally talk to Samsung's app over Bluetooth Classic (RFCOMM). iOS b
 
 See [`docs/`](docs/) for the probe page.
 
+## Findings so far (Buds2 Pro SM-R510, fw R510XXU0AZD1)
+
+Over BLE the iPhone sees Device Info, Battery, LE Audio services, and two Samsung-specific services:
+
+- `A7A473E9-19C6-491B-AEA6-7EA92B8F043A`: write `…8311`, notify `…8322` (likely control pipe)
+- `8FE1`: write `8FCC`, notify `8FCB`
+
+The probe page now has a **Samsung control test** panel that sends the Android app's ANC/Ambient/Off command over these pipes.
+
 ## Try the probe
 
 1. Enable GitHub Pages: repo **Settings → Pages → Deploy from branch → `main` / `/docs`**.

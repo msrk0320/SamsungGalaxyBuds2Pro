@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buds BLE Probe</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#111; --muted:#666; --accent:#1a6dff; --ok:#1a8f3c; --bad:#c62828; --border:#dde1e6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e1013; --card:#171a1f; --fg:#eee; --muted:#9aa0a6; --accent:#5b9bff; --ok:#4cc26f; --bad:#ef6b6b; --border:#2a2f36; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:4px 0 2px; }
+  p.sub { color:var(--muted); margin:0 0 14px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .card h2 { font-size:15px; margin:0 0 8px; }
+  ol { margin:0; padding-left:20px; }
+  button { font:inherit; border:0; border-radius:10px; padding:10px 14px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button:disabled { opacity:.5; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input { font:inherit; padding:9px 10px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg); flex:1; min-width:0; }
+  #status { font-weight:600; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .svc { border-top:1px solid var(--border); padding:8px 0; }
+  .svc:first-child { border-top:0; }
+  .uuid { font-family:ui-monospace, Menlo, monospace; font-size:12.5px; word-break:break-all; }
+  .chr { margin:6px 0 0 10px; padding-left:8px; border-left:2px solid var(--border); }
+  .props { color:var(--muted); font-size:12.5px; }
+  .chr .row { margin-top:4px; }
+  .chr button { padding:5px 9px; font-size:13px; }
+  #log { font-family:ui-monospace, Menlo, monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; max-height:320px; overflow:auto; background:var(--bg); padding:8px; border-radius:8px; margin:0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Galaxy Buds 2 Pro – BLE Probe</h1>
+  <p class="sub">Checks what the Buds expose to an iPhone over Bluetooth LE.</p>
+
+  <div class="card">
+    <h2>How to use</h2>
+    <ol>
+      <li>Install the free <b>Bluefy</b> browser from the App Store (Safari has no Web Bluetooth).</li>
+      <li>Open this page in Bluefy.</li>
+      <li>Buds in the case, lid open. If nothing shows up, long-press both touchpads (in ears) to enter pairing mode.</li>
+      <li>Tap <b>Scan</b>, pick the Buds, then tap <b>Copy report</b> and send it back.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="scan">Scan</button>
+      <button id="disconnect" class="secondary" disabled>Disconnect</button>
+      <button id="copy" class="secondary">Copy report</button>
+    </div>
+    <p>Status: <span id="status">idle</span></p>
+    <div class="row">
+      <input id="extra" placeholder="Extra service UUIDs (comma separated, optional)">
+    </div>
+  </div>
+
+  <div class="card"><h2>Services</h2><div id="services"><span class="props">Nothing yet.</span></div></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script>
+// Service UUIDs to ask for. Web Bluetooth only exposes services listed here.
+const KNOWN = {
+  'generic_access': 'Generic Access',
+  'generic_attribute': 'Generic Attribute',
+  'device_information': 'Device Information',
+  'battery_service': 'Battery',
+  0x184e: 'LE Audio: Audio Stream Control',
+  0x184f: 'LE Audio: Broadcast Audio Scan',
+  0x1850: 'LE Audio: Published Audio Capabilities',
+  0x1844: 'LE Audio: Volume Control',
+  0x1845: 'LE Audio: Volume Offset Control',
+  0x1846: 'LE Audio: Coordinated Set',
+  0x1848: 'LE Audio: Media Control',
+  0x184b: 'LE Audio: Telephony',
+  0x1854: 'Hearing Access',
+  0xfd69: 'Samsung (16-bit)',
+  0xfd6c: 'Samsung (16-bit)',
+  0xfe2c: 'Google Fast Pair',
+  '2e73a4ad-332d-41fc-90e2-16bef06523f2': 'Samsung Buds control (SPP UUID, if mirrored on GATT)',
+  '0000fd69-0000-1000-8000-00805f9b34fb': 'Samsung (128-bit form)',
+};
+
+const $ = id => document.getElementById(id);
+const logEl = $('log'), servicesEl = $('services'), statusEl = $('status');
+let device = null;
+const report = [];
+
+function log(msg) {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  report.push(line);
+  logEl.textContent += line + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(text, cls = '') { statusEl.textContent = text; statusEl.className = cls; }
+const hex = dv => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].map(b => b.toString(16).padStart(2, '0')).join(' ');
+const ascii = dv => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].map(b => b >= 32 && b < 127 ? String.fromCharCode(b) : '.').join('');
+function propsOf(p) {
+  return ['broadcast','read','writeWithoutResponse','write','notify','indicate','authenticatedSignedWrites']
+    .filter(k => p[k]).join(', ');
+}
+function parseHex(s) {
+  const clean = s.replace(/[^0-9a-f]/gi, '');
+  if (clean.length % 2) throw new Error('odd number of hex digits');
+  return new Uint8Array(clean.match(/../g)?.map(h => parseInt(h, 16)) || []);
+}
+
+async function scan() {
+  if (!navigator.bluetooth) {
+    setStatus('Web Bluetooth not available – open this page in Bluefy', 'bad');
+    log('navigator.bluetooth missing. UA: ' + navigator.userAgent);
+    return;
+  }
+  const extra = $('extra').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const optionalServices = [...Object.keys(KNOWN).map(k => isNaN(k) ? k : Number(k)), ...extra];
+  try {
+    setStatus('choose device…');
+    device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices });
+    log(`Picked: name="${device.name}" id=${device.id}`);
+    device.addEventListener('gattserverdisconnected', () => { log('Disconnected'); setStatus('disconnected', 'bad'); $('disconnect').disabled = true; });
+    setStatus('connecting…');
+    const server = await device.gatt.connect();
+    log('GATT connected');
+    setStatus('connected', 'ok');
+    $('disconnect').disabled = false;
+    await explore(server, optionalServices);
+  } catch (e) {
+    setStatus('error', 'bad');
+    log('Error: ' + e.name + ': ' + e.message);
+  }
+}
+
+async function explore(server, wanted) {
+  servicesEl.innerHTML = '';
+  let services = [];
+  try {
+    services = await server.getPrimaryServices();
+    log(`getPrimaryServices(): ${services.length} service(s)`);
+  } catch (e) {
+    log('getPrimaryServices() failed: ' + e.message + ' – trying each UUID');
+  }
+  if (!services.length) {
+    for (const u of wanted) {
+      try { services.push(await server.getPrimaryService(u)); } catch { /* not present */ }
+    }
+  }
+  if (!services.length) {
+    servicesEl.innerHTML = '<span class="bad">No accessible services. Try adding UUIDs above, or the Buds may not expose control over BLE.</span>';
+    log('No services found');
+    return;
+  }
+  for (const svc of services) await renderService(svc);
+  log('Done exploring');
+}
+
+async function renderService(svc) {
+  const name = Object.entries(KNOWN).find(([k]) => {
+    try { return BluetoothUUID.getService(isNaN(k) ? k : Number(k)) === svc.uuid; } catch { return false; }
+  })?.[1] || '';
+  log(`Service ${svc.uuid} ${name}`);
+  const box = document.createElement('div');
+  box.className = 'svc';
+  box.innerHTML = `<div><b>${name || 'Unknown service'}</b></div><div class="uuid">${svc.uuid}</div>`;
+  servicesEl.appendChild(box);
+  let chars = [];
+  try { chars = await svc.getCharacteristics(); } catch (e) { log('  getCharacteristics failed: ' + e.message); }
+  for (const c of chars) renderChar(box, c);
+}
+
+function renderChar(box, c) {
+  const props = propsOf(c.properties);
+  log(`  Char ${c.uuid} [${props}]`);
+  const el = document.createElement('div');
+  el.className = 'chr';
+  el.innerHTML = `<div class="uuid">${c.uuid}</div><div class="props">${props}</div><div class="row"></div><div class="uuid val"></div>`;
+  const row = el.querySelector('.row'), val = el.querySelector('.val');
+  const show = (dv, tag) => { val.textContent = `${tag}: ${hex(dv)}  |${ascii(dv)}|`; log(`  ${tag} ${c.uuid}: ${hex(dv)} |${ascii(dv)}|`); };
+
+  if (c.properties.read) {
+    const b = button('Read', async () => show(await c.readValue(), 'read'));
+    row.appendChild(b);
+    c.readValue().then(dv => show(dv, 'read')).catch(e => log(`  read ${c.uuid} failed: ${e.message}`));
+  }
+  if (c.properties.notify || c.properties.indicate) {
+    row.appendChild(button('Subscribe', async () => {
+      c.addEventListener('characteristicvaluechanged', ev => show(ev.target.value, 'notify'));
+      await c.startNotifications();
+      log(`  subscribed ${c.uuid}`);
+    }));
+  }
+  if (c.properties.write || c.properties.writeWithoutResponse) {
+    const input = document.createElement('input');
+    input.placeholder = 'hex, e.g. fd 03 00 ...';
+    row.appendChild(input);
+    row.appendChild(button('Write', async () => {
+      const bytes = parseHex(input.value);
+      if (c.properties.write) await c.writeValueWithResponse(bytes); else await c.writeValueWithoutResponse(bytes);
+      log(`  wrote ${c.uuid}: ${input.value}`);
+    }));
+  }
+  box.appendChild(el);
+}
+
+function button(label, fn) {
+  const b = document.createElement('button');
+  b.textContent = label;
+  b.onclick = async () => { try { await fn(); } catch (e) { log(`  ${label} failed: ${e.message}`); } };
+  return b;
+}
+
+$('scan').onclick = scan;
+$('disconnect').onclick = () => device?.gatt?.disconnect();
+$('copy').onclick = async () => {
+  const text = report.join('\n') || 'No data yet';
+  try { await navigator.clipboard.writeText(text); log('Report copied'); }
+  catch { prompt('Copy this report:', text); }
+};
+log('Ready. Web Bluetooth: ' + (navigator.bluetooth ? 'yes' : 'NO'));
+</script>
+</body>
+</html>

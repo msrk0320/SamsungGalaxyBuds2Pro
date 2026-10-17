@@ -76,8 +76,8 @@
     <div class="card">
       <h2>Battery</h2>
       <div class="batt">
-        <div><div class="pct" id="bL">–</div><div class="lbl">Left</div><div class="st" id="sL"></div></div>
-        <div><div class="pct" id="bR">–</div><div class="lbl">Right</div><div class="st" id="sR"></div></div>
+        <div><div class="pct" id="bL">–</div><div class="lbl" id="lL">Left</div><div class="st" id="sL"></div></div>
+        <div><div class="pct" id="bR">–</div><div class="lbl" id="lR">Right</div><div class="st" id="sR"></div></div>
         <div><div class="pct" id="bC">–</div><div class="lbl">Case</div><div class="st" id="sC"></div></div>
       </div>
     </div>
@@ -151,16 +151,12 @@
     <div class="card">
       <h2>Advanced</h2>
       <div class="row">
-        <div class="t">Seamless earbud connection<div class="d">Auto-switch between Samsung devices</div></div>
+        <div class="t">Seamless earbud connection<div class="d">Only matters between Samsung devices</div></div>
         <label class="sw"><input type="checkbox" id="seamless"><span></span></label>
       </div>
       <div class="row">
         <div class="t">Ambient sound during calls</div>
         <label class="sw"><input type="checkbox" id="sidetone"><span></span></label>
-      </div>
-      <div class="row">
-        <div class="t">360 Audio</div>
-        <label class="sw"><input type="checkbox" id="spatial"><span></span></label>
       </div>
     </div>
 
@@ -188,10 +184,15 @@ const TX = 'a7a48311-19c6-491b-aea6-7ea92b8f043a'; // phone → buds
 const RX = 'a7a48322-19c6-491b-aea6-7ea92b8f043a'; // buds → phone
 const DIS = '0000180a-0000-1000-8000-00805f9b34fb';
 const BAS = '0000180f-0000-1000-8000-00805f9b34fb';
+const ALT = '00008fe1-0000-1000-8000-00805f9b34fb'; // second Samsung service, listened to for debugging
+const BATT_LEVEL = '00002a19-0000-1000-8000-00805f9b34fb';
 const SOM = 0xfd, EOM = 0xdd;
+const ALT_SOM = 0xfc, ALT_EOM = 0xcc; // Samsung's alternative (SMEP) framing
+// Bluefy reports short UUIDs like "180F".
+const normUuid = u => /^[0-9a-f]{4}$/i.test(String(u)) ? `0000${String(u).toLowerCase()}-0000-1000-8000-00805f9b34fb` : String(u).toLowerCase();
 const ID = {
   ACK: 0x42, STATUS: 0x60, EXT_STATUS: 0x61, NOISE_UPDATE: 0x77, NOISE: 0x78,
-  ANC_ONE: 0x6f, DETECT: 0x7a, DETECT_DUR: 0x7b, SPATIAL: 0x7c, AMB_VOL: 0x84,
+  ANC_ONE: 0x6f, DETECT: 0x7a, DETECT_DUR: 0x7b, AMB_VOL: 0x84,
   EQ: 0x86, MANAGER_INFO: 0x88, SIDETONE: 0x8b, LOCK: 0x90, TOUCH_OPT: 0x92,
   EDGE: 0x95, FIND_START: 0xa0, FIND_STOP: 0xa1, SEAMLESS: 0xaf,
 };
@@ -216,8 +217,9 @@ const hex = a => [...a].map(b => b.toString(16).padStart(2, '0')).join(' ');
 const $ = id => document.getElementById(id);
 let device = null, tx = null, rx = null;
 let rxBuf = [];
-let rev = 0, touchBits = 0xff, finding = false;
-let writeChain = Promise.resolve();
+let rev = 0, touchBits = 0xff, finding = false, samsungStatus = false;
+const pending = new Map(); // msgId -> {payload, label}; newest value wins
+let pumping = false;
 const logLines = [];
 
 function log(msg) {
@@ -239,24 +241,44 @@ function describeErr(e) {
   try { return `${typeof e}: ${JSON.stringify(e) ?? String(e)}`; } catch { return String(e); }
 }
 
-// Writes are queued so only one GATT operation runs at a time.
+// One GATT write at a time. Repeated taps on the same control collapse into the latest value,
+// and write-without-response skips the round trip that made controls feel slow.
 function send(id, payload = [], label = NAMES[id]) {
-  const data = frame(id, payload);
-  writeChain = writeChain.then(async () => {
-    if (!tx) throw new Error('not connected');
-    log(`▶ ${label} ${hex(data)}`);
-    if (tx.properties.write) await tx.writeValueWithResponse(data);
-    else await tx.writeValueWithoutResponse(data);
-  }).catch(e => { log(`write ${label} failed: ${describeErr(e)}`); toast('Send failed – reconnect?'); });
-  return writeChain;
+  pending.delete(id);
+  pending.set(id, { payload, label });
+  pump();
+}
+async function pump() {
+  if (pumping) return;
+  pumping = true;
+  try {
+    while (pending.size) {
+      const [id, { payload, label }] = pending.entries().next().value;
+      pending.delete(id);
+      const data = frame(id, payload);
+      try {
+        if (!tx) throw new Error('not connected');
+        log(`▶ ${label} ${hex(data)}`);
+        if (tx.properties.writeWithoutResponse) await tx.writeValueWithoutResponse(data);
+        else await tx.writeValueWithResponse(data);
+      } catch (e) {
+        log(`write ${label} failed: ${describeErr(e)}`);
+        toast('Send failed – reconnect?');
+      }
+    }
+  } finally {
+    pumping = false;
+  }
 }
 
 // ---- Incoming stream: notifications can split or merge frames ----
 function onNotify(ev) {
   const dv = ev.target.value;
-  rxBuf.push(...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength));
+  const bytes = [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)];
+  log(`◀ raw ${hex(bytes)}`);
+  rxBuf.push(...bytes);
   while (rxBuf.length) {
-    const start = rxBuf.indexOf(SOM);
+    const start = rxBuf.findIndex(b => b === SOM || b === ALT_SOM);
     if (start < 0) { rxBuf = []; return; }
     if (start > 0) rxBuf = rxBuf.slice(start);
     if (rxBuf.length < 3) return;
@@ -266,7 +288,7 @@ function onNotify(ev) {
     if (rxBuf.length < total) return;
     const pkt = rxBuf.slice(0, total);
     rxBuf = rxBuf.slice(total);
-    if (pkt[total - 1] !== EOM) { log(`◀ bad EOM: ${hex(pkt)}`); continue; }
+    if (pkt[total - 1] !== (pkt[0] === SOM ? EOM : ALT_EOM)) { log(`◀ bad EOM: ${hex(pkt)}`); continue; }
     const id = pkt[3], payload = pkt.slice(4, total - 3);
     if (crc16([id, ...payload]) !== (pkt[total - 3] | (pkt[total - 2] << 8))) {
       log(`◀ bad CRC: ${hex(pkt)}`); continue;
@@ -288,6 +310,8 @@ function handle(id, p) {
 // ---- Decoding (Buds2 Pro layouts from GalaxyBudsClient decoders) ----
 const PLACE = { 0: '', 1: 'In ear', 2: 'Out', 3: 'In case', 4: 'In case' };
 function setBattery(l, r, c, place, charging) {
+  samsungStatus = true;
+  $('lL').textContent = 'Left'; $('lR').textContent = 'Right';
   const fmt = v => (v >= 0 && v <= 100 ? v + '%' : '–');
   $('bL').textContent = fmt(l); $('bR').textContent = fmt(r); $('bC').textContent = fmt(c);
   $('sL').textContent = charging & 0x10 ? 'Charging' : PLACE[(place >> 4) & 0x0f] || '';
@@ -304,7 +328,6 @@ function showExtStatus(p) {
   touchBits = p[10];
   let charging = 0;
   // Optional tail after byte 34: callPath, spatial, convBoost, customNR, neck, bixby, hearingTest, [autoAdjust r3+], [headTracking r8+], [charging r11+]
-  if (p.length > 35) $('spatial').checked = p[35] === 1;
   let i = 41;
   if (rev >= 3) i++;
   if (rev >= 8) i++;
@@ -337,8 +360,8 @@ function selectNoise(mode) {
 // ---- Connection ----
 async function pickDevice() {
   const opts = [
-    { filters: [{ namePrefix: 'Galaxy Buds2 Pro' }, { namePrefix: 'Buds2 Pro' }], optionalServices: [SVC, DIS, BAS] },
-    { acceptAllDevices: true, optionalServices: [SVC, DIS, BAS] },
+    { filters: [{ namePrefix: 'Galaxy Buds2 Pro' }, { namePrefix: 'Buds2 Pro' }], optionalServices: [SVC, DIS, BAS, ALT] },
+    { acceptAllDevices: true, optionalServices: [SVC, DIS, BAS, ALT] },
   ];
   let lastErr;
   for (const o of opts) {
@@ -370,8 +393,11 @@ async function connect() {
     tx = await svc.getCharacteristic(TX);
     rx = await svc.getCharacteristic(RX);
     rxBuf = [];
+    pending.clear();
+    rx.removeEventListener('characteristicvaluechanged', onNotify);
     rx.addEventListener('characteristicvaluechanged', onNotify);
     await rx.startNotifications();
+    log('Listening on Samsung pipe');
     setStatus(`Connected · ${device.name}`, 'on');
     $('connect').textContent = 'Disconnect';
     $('app').classList.remove('hidden');
@@ -386,27 +412,62 @@ async function connect() {
   }
 }
 
+// Standard BLE battery + device info. Battery first; device info is cached so later
+// connects don't queue slow reads in front of the user's taps.
 async function readInfo(server) {
-  const dec = new TextDecoder();
-  const rows = [];
-  try {
-    const dis = await server.getPrimaryService(DIS);
-    for (const [uuid, label] of [['2a24', 'Model'], ['2a26', 'Firmware'], ['2a25', 'Serial'], ['2a29', 'Maker']]) {
-      try {
-        const c = await dis.getCharacteristic(`0000${uuid}-0000-1000-8000-00805f9b34fb`);
-        rows.push([label, dec.decode(await c.readValue())]);
-      } catch { /* not readable */ }
+  let services = [];
+  try { services = await server.getPrimaryServices(); } // Bluefy breaks on getPrimaryServices(uuid)
+  catch (e) { log('Service list unavailable: ' + describeErr(e)); }
+  const byUuid = u => services.filter(s => normUuid(s.uuid) === u);
+
+  const bas = byUuid(BAS);
+  const levels = [];
+  for (const [i, s] of bas.entries()) {
+    try {
+      const c = await s.getCharacteristic(BATT_LEVEL);
+      levels[i] = (await c.readValue()).getUint8(0);
+      c.addEventListener('characteristicvaluechanged', ev => { levels[i] = ev.target.value.getUint8(0); showBleBattery(levels); });
+      c.startNotifications().catch(() => {});
+    } catch (e) { log('Battery read failed: ' + describeErr(e)); }
+  }
+  log(`BLE battery: ${levels.join(', ') || 'none'}`);
+  showBleBattery(levels);
+
+  for (const s of byUuid(ALT)) {
+    try {
+      for (const c of await s.getCharacteristics()) {
+        if (!c.properties.notify) continue;
+        c.addEventListener('characteristicvaluechanged', ev => { const v = ev.target.value; log(`◀ 8FE1/${c.uuid}: ${hex(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))}`); });
+        await c.startNotifications();
+      }
+    } catch (e) { log('8FE1 listen failed: ' + describeErr(e)); }
+  }
+
+  const key = 'info:' + device.id;
+  let rows = null;
+  try { rows = JSON.parse(localStorage.getItem(key)); } catch { /* no storage */ }
+  if (!rows) {
+    rows = [];
+    const dis = byUuid(DIS)[0];
+    const dec = new TextDecoder();
+    for (const [uuid, label] of [['2a24', 'Model'], ['2a26', 'Firmware'], ['2a25', 'Serial']]) {
+      try { rows.push([label, dec.decode(await (await dis.getCharacteristic(`0000${uuid}-0000-1000-8000-00805f9b34fb`)).readValue())]); }
+      catch { /* not readable */ }
     }
-  } catch (e) { log('Device info unavailable: ' + describeErr(e)); }
-  if (rows.length) $('info').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v.replace(/[<>&]/g, '')}</dd>`).join('');
-  // Fallback battery from the standard Battery Service until Samsung status arrives.
-  try {
-    const bas = await server.getPrimaryServices(BAS);
-    const vals = [];
-    for (const s of bas) vals.push((await (await s.getCharacteristic('00002a19-0000-1000-8000-00805f9b34fb')).readValue()).getUint8(0));
-    log(`BLE battery: ${vals.join(', ')}`);
-    if ($('bL').textContent === '–' && vals.length) { $('bL').textContent = vals[0] + '%'; $('bR').textContent = (vals[1] ?? vals[0]) + '%'; }
-  } catch (e) { log('Battery service unavailable: ' + describeErr(e)); }
+    try { if (rows.length) localStorage.setItem(key, JSON.stringify(rows)); } catch { /* no storage */ }
+  }
+  if (rows.length) $('info').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${String(v).replace(/[<>&]/g, '')}</dd>`).join('');
+}
+
+// Used until the Samsung status message arrives (it has proper left/right/case values).
+function showBleBattery(levels) {
+  if (samsungStatus) return;
+  const v = levels.filter(x => x >= 0 && x <= 100);
+  if (!v.length) return;
+  $('bL').textContent = v[0] + '%';
+  $('bR').textContent = v.length > 1 ? v[1] + '%' : '–';
+  $('lL').textContent = 'Earbud'; $('lR').textContent = v.length > 1 ? 'Earbud' : '';
+  $('sL').textContent = $('sR').textContent = '';
 }
 
 function onDisconnected() {
@@ -434,7 +495,6 @@ toggle('detect', ID.DETECT);
 toggle('ancOne', ID.ANC_ONE);
 toggle('edge', ID.EDGE);
 toggle('sidetone', ID.SIDETONE);
-toggle('spatial', ID.SPATIAL);
 toggle('seamless', ID.SEAMLESS, true); // buds store "seamless disabled"
 $('detectDur').onchange = e => send(ID.DETECT_DUR, [Number(e.target.value)]);
 $('eq').onchange = e => send(ID.EQ, [Number(e.target.value)]);

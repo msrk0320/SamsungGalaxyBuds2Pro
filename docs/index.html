@@ -21,6 +21,7 @@
   button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
   button:disabled { opacity:.5; }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  select { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg); }
   input { font:inherit; padding:9px 10px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg); flex:1; min-width:0; }
   #status { font-weight:600; }
   .ok { color:var(--ok); } .bad { color:var(--bad); }
@@ -61,6 +62,27 @@
     </div>
   </div>
 
+  <div class="card" id="ctl" hidden>
+    <h2>Samsung control test</h2>
+    <p class="props">Wear the Buds. Tap <b>Listen</b>, then try each button and say which one changed the sound (you'll hear ANC/Ambient switch). Then <b>Copy report</b>.</p>
+    <div class="row">
+      <label>Pipe <select id="pipe"></select></label>
+      <button id="listen">1. Listen</button>
+    </div>
+    <p class="props">Format A (FD…DD, same as Android app):</p>
+    <div class="row">
+      <button data-fmt="A" data-mode="1">ANC</button>
+      <button data-fmt="A" data-mode="2">Ambient</button>
+      <button data-fmt="A" data-mode="0">Off</button>
+    </div>
+    <p class="props">Format B (FC…CC, alternative framing):</p>
+    <div class="row">
+      <button data-fmt="B" data-mode="1">ANC</button>
+      <button data-fmt="B" data-mode="2">Ambient</button>
+      <button data-fmt="B" data-mode="0">Off</button>
+    </div>
+  </div>
+
   <div class="card"><h2>Services</h2><div id="services"><span class="props">Nothing yet.</span></div></div>
   <div class="card"><h2>Log</h2><pre id="log"></pre></div>
 </main>
@@ -98,6 +120,43 @@ const KNOWN_FULL = Object.fromEntries(Object.entries(KNOWN).map(([k, v]) => [ful
 function describeErr(e) {
   if (e && (e.name || e.message)) return `${e.name || 'Error'}: ${e.message || ''}`;
   try { return `${typeof e}: ${JSON.stringify(e) ?? String(e)}`; } catch { return String(e); }
+}
+
+// UUIDs as reported by the browser (Bluefy uses short uppercase like "180A").
+const normUuid = u => /^[0-9a-f]{4}$/i.test(String(u))
+  ? `0000${String(u).toLowerCase()}-0000-1000-8000-00805f9b34fb`
+  : String(u).toLowerCase();
+
+// Candidate Samsung control pipes seen on Buds2 Pro (SM-R510): write → notify.
+const PIPES = [
+  { label: 'A7A4 (Samsung private)', write: 'a7a48311-19c6-491b-aea6-7ea92b8f043a', notify: 'a7a48322-19c6-491b-aea6-7ea92b8f043a' },
+  { label: '8FE1 (Samsung 16-bit)', write: normUuid('8fcc'), notify: normUuid('8fcb') },
+];
+const chars = new Map(); // normalized uuid -> characteristic
+
+// Samsung SPP framing, as in GalaxyBudsClient (SppMessage.Encode / Crc16.crc16_ccitt).
+const MSG = { 0x60: 'STATUS_UPDATED', 0x61: 'EXTENDED_STATUS_UPDATED', 0x42: 'ACK', 0x78: 'NOISE_CONTROLS', 0x77: 'NOISE_CONTROLS_UPDATE' };
+function crc16(bytes) {
+  let crc = 0;
+  for (const b of bytes) {
+    crc ^= b << 8;
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+  }
+  return crc;
+}
+function samsungFrame(id, payload, fmt = 'A') {
+  const [som, eom] = fmt === 'A' ? [0xfd, 0xdd] : [0xfc, 0xcc];
+  const size = payload.length + 3; // id + crc16
+  const crc = crc16([id, ...payload]);
+  return new Uint8Array([som, size & 0xff, (size >> 8) & 0x0f, id, ...payload, crc & 0xff, crc >> 8, eom]);
+}
+function decodeFrame(bytes) {
+  if (bytes.length < 7 || ![0xfd, 0xfc].includes(bytes[0])) return '';
+  const size = bytes[1] | ((bytes[2] & 0x0f) << 8);
+  const id = bytes[3];
+  const payload = bytes.slice(4, 4 + size - 3);
+  const crcOk = crc16([id, ...payload]) === (bytes[1 + 2 + size - 2] | (bytes[1 + 2 + size - 1] << 8));
+  return ` → Samsung msg 0x${id.toString(16)} ${MSG[id] || ''} len=${payload.length} crc=${crcOk ? 'ok' : 'BAD'}`;
 }
 
 const $ = id => document.getElementById(id);
@@ -188,12 +247,14 @@ async function explore(server, wanted) {
     log('No services found');
     return;
   }
+  chars.clear();
   for (const svc of services) await renderService(svc);
   log('Done exploring');
+  setupControlPanel();
 }
 
 async function renderService(svc) {
-  const name = KNOWN_FULL[String(svc.uuid).toLowerCase()] || '';
+  const name = KNOWN_FULL[normUuid(svc.uuid)] || '';
   log(`Service ${svc.uuid} ${name}`);
   const box = document.createElement('div');
   box.className = 'svc';
@@ -204,7 +265,42 @@ async function renderService(svc) {
   for (const c of chars) renderChar(box, c);
 }
 
+function setupControlPanel() {
+  const available = PIPES.filter(p => chars.has(p.write));
+  if (!available.length) { log('No known Samsung pipe found'); return; }
+  $('pipe').innerHTML = available.map(p => `<option value="${PIPES.indexOf(p)}">${p.label}</option>`).join('');
+  $('ctl').hidden = false;
+}
+const currentPipe = () => PIPES[Number($('pipe').value)];
+
+async function listen() {
+  const p = currentPipe(), c = chars.get(p.notify);
+  if (!c) return log(`Pipe ${p.label}: no notify characteristic`);
+  if (c.__listening) return log(`Already listening on ${p.label}`);
+  c.addEventListener('characteristicvaluechanged', ev => {
+    const dv = ev.target.value, bytes = [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)];
+    log(`  ◀ ${p.label}: ${hex(dv)}${decodeFrame(bytes)}`);
+  });
+  await c.startNotifications();
+  c.__listening = true;
+  log(`Listening on ${p.label}. Take one bud out of the case or touch it to trigger a status message.`);
+}
+
+async function sendNoise(fmt, mode) {
+  const p = currentPipe(), c = chars.get(p.write);
+  const frame = samsungFrame(0x78, [mode], fmt);
+  const name = { 0: 'Off', 1: 'ANC', 2: 'Ambient' }[mode];
+  log(`  ▶ ${p.label} format ${fmt} ${name}: ${[...frame].map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+  try {
+    if (c.properties.write) await c.writeValueWithResponse(frame); else await c.writeValueWithoutResponse(frame);
+    log('    write ok');
+  } catch (e) {
+    log('    write failed: ' + describeErr(e));
+  }
+}
+
 function renderChar(box, c) {
+  chars.set(normUuid(c.uuid), c);
   const props = propsOf(c.properties);
   log(`  Char ${c.uuid} [${props}]`);
   const el = document.createElement('div');
@@ -246,6 +342,10 @@ function button(label, fn) {
 }
 
 $('scan').onclick = scan;
+$('listen').onclick = () => listen().catch(e => log('Listen failed: ' + describeErr(e)));
+document.querySelectorAll('#ctl [data-fmt]').forEach(b => {
+  b.onclick = () => sendNoise(b.dataset.fmt, Number(b.dataset.mode));
+});
 $('disconnect').onclick = () => device?.gatt?.disconnect();
 $('copy').onclick = async () => {
   const text = report.join('\n') || 'No data yet';

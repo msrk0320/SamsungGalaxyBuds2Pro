@@ -1,34 +1,36 @@
 # Galaxy Buds 2 Pro Manager for iPhone
 
-Open-source attempt to control Galaxy Buds 2 Pro (ANC, EQ, touch controls) from an iPhone without Samsung's app.
+Control Galaxy Buds2 Pro from an iPhone with no Samsung app and no App Store install. It's a web page that talks to the Buds over Bluetooth LE.
 
-## Status: Phase 1 – feasibility probe
+**Open:** https://msrk0320.github.io/SamsungGalaxyBuds2Pro/ in the free **Bluefy** browser (Safari has no Web Bluetooth).
 
-Buds 2 Pro normally talk to Samsung's app over Bluetooth Classic (RFCOMM). iOS blocks that for non-MFi apps, so an iPhone can only use **BLE**. We first check whether the Buds expose anything useful over BLE.
+## Features
 
-See [`docs/`](docs/) for the probe page.
+- Battery: left, right, case, wear and charging state
+- Noise controls: Off / ANC / Ambient, ambient level, voice detect, ANC with one earbud
+- Equalizer presets
+- Touch lock, touch-and-hold action per side, double-tap edge for volume
+- Find my Buds
+- Seamless connection, ambient sound during calls, 360 Audio
+- Model, firmware and serial
 
-## Findings so far (Buds2 Pro SM-R510, fw R510XXU0AZD1)
+## How it works
 
-Over BLE the iPhone sees Device Info, Battery, LE Audio services, and two Samsung-specific services:
+Samsung's Android app talks to the Buds over Bluetooth Classic (RFCOMM), which iOS blocks for non-MFi apps. On Buds2 Pro (SM-R510), the same Samsung message protocol is also available over a BLE GATT pipe:
 
-- `A7A473E9-19C6-491B-AEA6-7EA92B8F043A`: write `…8311`, notify `…8322` (likely control pipe)
-- `8FE1`: write `8FCC`, notify `8FCB`
+| | UUID |
+|---|---|
+| Service | `a7a473e9-19c6-491b-aea6-7ea92b8f043a` |
+| Write (phone → buds) | `a7a48311-…` |
+| Notify (buds → phone) | `a7a48322-…` |
 
-The probe page now has a **Samsung control test** panel that sends the Android app's ANC/Ambient/Off command over these pipes.
+Messages use Samsung's SPP framing: `FD | size(2, LE) | msgId | payload | CRC16-CCITT(LE) | DD`. Message IDs and payload layouts come from the open-source [GalaxyBudsClient](https://github.com/timschneeb/GalaxyBudsClient) project.
 
-## Try the probe
+`docs/probe.html` is the BLE probe used to find the pipe.
 
-1. Enable GitHub Pages: repo **Settings → Pages → Deploy from branch → `main` / `/docs`**.
-2. On iPhone, install **Bluefy** (free, App Store) and open `https://msrk0320.github.io/SamsungGalaxyBuds2Pro/`.
-3. Tap **Scan**, pick the Buds, then **Copy report**.
+## Tested
 
-## Roadmap
-
-- **Phase 1 (now):** BLE probe – what services do the Buds expose to iPhone?
-- **Phase 2 (if a control channel exists):** use [REA](https://github.com/morluto/rea) on Samsung's Galaxy Wearable / Buds 2 Pro plugin APK to map the message IDs (ANC, ambient, EQ, touch lock, battery), cross-checked with the protocol documented by [GalaxyBudsClient](https://github.com/timschneeb/GalaxyBudsClient).
-- **Phase 3:** full manager UI in the same web page (no App Store app, no Mac needed).
-
-If BLE exposes nothing useful, iPhone control isn't possible without Apple MFi certification; the fallback is managing the Buds from a PC.
+- Real Buds2 Pro (firmware R510XXU0AZD1) on iPhone 15 Pro with Bluefy: GATT discovery and ANC/Ambient/Off switching over the A7A4 pipe.
+- All other controls and status decoding: tested against a simulated device. Please report anything that doesn't work.
 
 For personal interoperability use only. Not affiliated with Samsung.

@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buds BLE Probe</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#111; --muted:#666; --accent:#1a6dff; --ok:#1a8f3c; --bad:#c62828; --border:#dde1e6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e1013; --card:#171a1f; --fg:#eee; --muted:#9aa0a6; --accent:#5b9bff; --ok:#4cc26f; --bad:#ef6b6b; --border:#2a2f36; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:4px 0 2px; }
+  p.sub { color:var(--muted); margin:0 0 14px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .card h2 { font-size:15px; margin:0 0 8px; }
+  ol { margin:0; padding-left:20px; }
+  button { font:inherit; border:0; border-radius:10px; padding:10px 14px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button:disabled { opacity:.5; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  select { font:inherit; padding:8px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg); }
+  input { font:inherit; padding:9px 10px; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--fg); flex:1; min-width:0; }
+  #status { font-weight:600; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .svc { border-top:1px solid var(--border); padding:8px 0; }
+  .svc:first-child { border-top:0; }
+  .uuid { font-family:ui-monospace, Menlo, monospace; font-size:12.5px; word-break:break-all; }
+  .chr { margin:6px 0 0 10px; padding-left:8px; border-left:2px solid var(--border); }
+  .props { color:var(--muted); font-size:12.5px; }
+  .chr .row { margin-top:4px; }
+  .chr button { padding:5px 9px; font-size:13px; }
+  #log { font-family:ui-monospace, Menlo, monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; max-height:320px; overflow:auto; background:var(--bg); padding:8px; border-radius:8px; margin:0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Galaxy Buds 2 Pro – BLE Probe</h1>
+  <p class="sub">Checks what the Buds expose to an iPhone over Bluetooth LE.</p>
+
+  <div class="card">
+    <h2>How to use</h2>
+    <ol>
+      <li>Install the free <b>Bluefy</b> browser from the App Store (Safari has no Web Bluetooth).</li>
+      <li>Open this page in Bluefy.</li>
+      <li>Buds in the case, lid open. If nothing shows up, long-press both touchpads (in ears) to enter pairing mode.</li>
+      <li>Tap <b>Scan</b>, pick the Buds, then tap <b>Copy report</b> and send it back.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="scan">Scan</button>
+      <button id="disconnect" class="secondary" disabled>Disconnect</button>
+      <button id="copy" class="secondary">Copy report</button>
+    </div>
+    <p>Status: <span id="status">idle</span></p>
+    <div class="row">
+      <input id="extra" placeholder="Extra service UUIDs (comma separated, optional)">
+    </div>
+  </div>
+
+  <div class="card" id="ctl" hidden>
+    <h2>Samsung control test</h2>
+    <p class="props">Wear the Buds. Tap <b>Listen</b>, then try each button and say which one changed the sound (you'll hear ANC/Ambient switch). Then <b>Copy report</b>.</p>
+    <div class="row">
+      <label>Pipe <select id="pipe"></select></label>
+      <button id="listen">1. Listen</button>
+    </div>
+    <p class="props">Format A (FD…DD, same as Android app):</p>
+    <div class="row">
+      <button data-fmt="A" data-mode="1">ANC</button>
+      <button data-fmt="A" data-mode="2">Ambient</button>
+      <button data-fmt="A" data-mode="0">Off</button>
+    </div>
+    <p class="props">Format B (FC…CC, alternative framing):</p>
+    <div class="row">
+      <button data-fmt="B" data-mode="1">ANC</button>
+      <button data-fmt="B" data-mode="2">Ambient</button>
+      <button data-fmt="B" data-mode="0">Off</button>
+    </div>
+  </div>
+
+  <div class="card"><h2>Services</h2><div id="services"><span class="props">Nothing yet.</span></div></div>
+  <div class="card"><h2>Log</h2><pre id="log"></pre></div>
+</main>
+
+<script>
+// Service UUIDs to ask for. Web Bluetooth only exposes services listed here.
+const KNOWN = {
+  0x1800: 'Generic Access',
+  0x1801: 'Generic Attribute',
+  0x180a: 'Device Information',
+  0x180f: 'Battery',
+  0x184e: 'LE Audio: Audio Stream Control',
+  0x184f: 'LE Audio: Broadcast Audio Scan',
+  0x1850: 'LE Audio: Published Audio Capabilities',
+  0x1844: 'LE Audio: Volume Control',
+  0x1845: 'LE Audio: Volume Offset Control',
+  0x1846: 'LE Audio: Coordinated Set',
+  0x1848: 'LE Audio: Media Control',
+  0x184b: 'LE Audio: Telephony',
+  0x1854: 'Hearing Access',
+  0xfd69: 'Samsung (16-bit)',
+  0xfd6c: 'Samsung (16-bit)',
+  0xfe2c: 'Google Fast Pair',
+  '2e73a4ad-332d-41fc-90e2-16bef06523f2': 'Samsung Buds control (SPP UUID, if mirrored on GATT)',
+};
+
+// Not requested: some browsers reject these in optionalServices.
+const SKIP_REQUEST = [0x1800, 0x1801];
+// Full lowercase 128-bit form; doesn't rely on BluetoothUUID (missing in some iOS browsers).
+const fullUuid = k => /^\d+$/.test(String(k))
+  ? `0000${Number(k).toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`
+  : String(k).toLowerCase();
+const KNOWN_FULL = Object.fromEntries(Object.entries(KNOWN).map(([k, v]) => [fullUuid(k), v]));
+// Bluefy can reject with non-Error values, so describe whatever we get.
+function describeErr(e) {
+  if (e && (e.name || e.message)) return `${e.name || 'Error'}: ${e.message || ''}`;
+  try { return `${typeof e}: ${JSON.stringify(e) ?? String(e)}`; } catch { return String(e); }
+}
+
+// UUIDs as reported by the browser (Bluefy uses short uppercase like "180A").
+const normUuid = u => /^[0-9a-f]{4}$/i.test(String(u))
+  ? `0000${String(u).toLowerCase()}-0000-1000-8000-00805f9b34fb`
+  : String(u).toLowerCase();
+
+// Candidate Samsung control pipes seen on Buds2 Pro (SM-R510): write → notify.
+const PIPES = [
+  { label: 'A7A4 (Samsung private)', write: 'a7a48311-19c6-491b-aea6-7ea92b8f043a', notify: 'a7a48322-19c6-491b-aea6-7ea92b8f043a' },
+  { label: '8FE1 (Samsung 16-bit)', write: normUuid('8fcc'), notify: normUuid('8fcb') },
+];
+const chars = new Map(); // normalized uuid -> characteristic
+
+// Samsung SPP framing, as in GalaxyBudsClient (SppMessage.Encode / Crc16.crc16_ccitt).
+const MSG = { 0x60: 'STATUS_UPDATED', 0x61: 'EXTENDED_STATUS_UPDATED', 0x42: 'ACK', 0x78: 'NOISE_CONTROLS', 0x77: 'NOISE_CONTROLS_UPDATE' };
+function crc16(bytes) {
+  let crc = 0;
+  for (const b of bytes) {
+    crc ^= b << 8;
+    for (let i = 0; i < 8; i++) crc = crc & 0x8000 ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+  }
+  return crc;
+}
+function samsungFrame(id, payload, fmt = 'A') {
+  const [som, eom] = fmt === 'A' ? [0xfd, 0xdd] : [0xfc, 0xcc];
+  const size = payload.length + 3; // id + crc16
+  const crc = crc16([id, ...payload]);
+  return new Uint8Array([som, size & 0xff, (size >> 8) & 0x0f, id, ...payload, crc & 0xff, crc >> 8, eom]);
+}
+function decodeFrame(bytes) {
+  if (bytes.length < 7 || ![0xfd, 0xfc].includes(bytes[0])) return '';
+  const size = bytes[1] | ((bytes[2] & 0x0f) << 8);
+  const id = bytes[3];
+  const payload = bytes.slice(4, 4 + size - 3);
+  const crcOk = crc16([id, ...payload]) === (bytes[1 + 2 + size - 2] | (bytes[1 + 2 + size - 1] << 8));
+  return ` → Samsung msg 0x${id.toString(16)} ${MSG[id] || ''} len=${payload.length} crc=${crcOk ? 'ok' : 'BAD'}`;
+}
+
+const $ = id => document.getElementById(id);
+const logEl = $('log'), servicesEl = $('services'), statusEl = $('status');
+let device = null;
+const report = [];
+
+function log(msg) {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  report.push(line);
+  logEl.textContent += line + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(text, cls = '') { statusEl.textContent = text; statusEl.className = cls; }
+const hex = dv => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].map(b => b.toString(16).padStart(2, '0')).join(' ');
+const ascii = dv => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].map(b => b >= 32 && b < 127 ? String.fromCharCode(b) : '.').join('');
+function propsOf(p) {
+  return ['broadcast','read','writeWithoutResponse','write','notify','indicate','authenticatedSignedWrites']
+    .filter(k => p[k]).join(', ');
+}
+function parseHex(s) {
+  const clean = s.replace(/[^0-9a-f]/gi, '');
+  if (clean.length % 2) throw new Error('odd number of hex digits');
+  return new Uint8Array(clean.match(/../g)?.map(h => parseInt(h, 16)) || []);
+}
+
+async function scan() {
+  if (!navigator.bluetooth) {
+    setStatus('Web Bluetooth not available – open this page in Bluefy', 'bad');
+    log('navigator.bluetooth missing. UA: ' + navigator.userAgent);
+    return;
+  }
+  const extra = $('extra').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const optionalServices = [...Object.keys(KNOWN).filter(k => !SKIP_REQUEST.includes(Number(k))).map(fullUuid), ...extra];
+  // Try the full UUID list first; if the browser rejects it, retry without it.
+  const attempts = [
+    { label: 'all devices + service list', opts: { acceptAllDevices: true, optionalServices } },
+    { label: 'all devices, no service list', opts: { acceptAllDevices: true } },
+  ];
+  device = null;
+  for (const a of attempts) {
+    try {
+      setStatus('choose device…');
+      log(`requestDevice (${a.label})`);
+      device = await navigator.bluetooth.requestDevice(a.opts);
+      break;
+    } catch (e) {
+      log('requestDevice failed: ' + describeErr(e));
+      if (e && e.name === 'NotFoundError' && /cancel/i.test(e.message || '')) break;
+    }
+  }
+  if (!device) {
+    setStatus('no device picked', 'bad');
+    log('Check: iPhone Settings → Bluefy → Bluetooth is ON, and Bluetooth is on in Control Center.');
+    return;
+  }
+  try {
+    log(`Picked: name="${device.name}" id=${device.id}`);
+    device.addEventListener('gattserverdisconnected', () => { log('Disconnected'); setStatus('disconnected', 'bad'); $('disconnect').disabled = true; });
+    setStatus('connecting…');
+    const server = await device.gatt.connect();
+    log('GATT connected');
+    setStatus('connected', 'ok');
+    $('disconnect').disabled = false;
+    await explore(server, optionalServices);
+  } catch (e) {
+    setStatus('error', 'bad');
+    log('Error: ' + describeErr(e));
+  }
+}
+
+async function explore(server, wanted) {
+  servicesEl.innerHTML = '';
+  let services = [];
+  try {
+    services = await server.getPrimaryServices();
+    log(`getPrimaryServices(): ${services.length} service(s)`);
+  } catch (e) {
+    log('getPrimaryServices() failed: ' + describeErr(e) + ' – trying each UUID');
+  }
+  if (!services.length) {
+    for (const u of wanted) {
+      try { services.push(await server.getPrimaryService(u)); } catch { /* not present */ }
+    }
+  }
+  if (!services.length) {
+    servicesEl.innerHTML = '<span class="bad">No accessible services. Try adding UUIDs above, or the Buds may not expose control over BLE.</span>';
+    log('No services found');
+    return;
+  }
+  chars.clear();
+  for (const svc of services) await renderService(svc);
+  log('Done exploring');
+  setupControlPanel();
+}
+
+async function renderService(svc) {
+  const name = KNOWN_FULL[normUuid(svc.uuid)] || '';
+  log(`Service ${svc.uuid} ${name}`);
+  const box = document.createElement('div');
+  box.className = 'svc';
+  box.innerHTML = `<div><b>${name || 'Unknown service'}</b></div><div class="uuid">${svc.uuid}</div>`;
+  servicesEl.appendChild(box);
+  let chars = [];
+  try { chars = await svc.getCharacteristics(); } catch (e) { log('  getCharacteristics failed: ' + describeErr(e)); }
+  for (const c of chars) renderChar(box, c);
+}
+
+function setupControlPanel() {
+  const available = PIPES.filter(p => chars.has(p.write));
+  if (!available.length) { log('No known Samsung pipe found'); return; }
+  $('pipe').innerHTML = available.map(p => `<option value="${PIPES.indexOf(p)}">${p.label}</option>`).join('');
+  $('ctl').hidden = false;
+}
+const currentPipe = () => PIPES[Number($('pipe').value)];
+
+async function listen() {
+  const p = currentPipe(), c = chars.get(p.notify);
+  if (!c) return log(`Pipe ${p.label}: no notify characteristic`);
+  if (c.__listening) return log(`Already listening on ${p.label}`);
+  c.addEventListener('characteristicvaluechanged', ev => {
+    const dv = ev.target.value, bytes = [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)];
+    log(`  ◀ ${p.label}: ${hex(dv)}${decodeFrame(bytes)}`);
+  });
+  await c.startNotifications();
+  c.__listening = true;
+  log(`Listening on ${p.label}. Take one bud out of the case or touch it to trigger a status message.`);
+}
+
+async function sendNoise(fmt, mode) {
+  const p = currentPipe(), c = chars.get(p.write);
+  const frame = samsungFrame(0x78, [mode], fmt);
+  const name = { 0: 'Off', 1: 'ANC', 2: 'Ambient' }[mode];
+  log(`  ▶ ${p.label} format ${fmt} ${name}: ${[...frame].map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+  try {
+    if (c.properties.write) await c.writeValueWithResponse(frame); else await c.writeValueWithoutResponse(frame);
+    log('    write ok');
+  } catch (e) {
+    log('    write failed: ' + describeErr(e));
+  }
+}
+
+function renderChar(box, c) {
+  chars.set(normUuid(c.uuid), c);
+  const props = propsOf(c.properties);
+  log(`  Char ${c.uuid} [${props}]`);
+  const el = document.createElement('div');
+  el.className = 'chr';
+  el.innerHTML = `<div class="uuid">${c.uuid}</div><div class="props">${props}</div><div class="row"></div><div class="uuid val"></div>`;
+  const row = el.querySelector('.row'), val = el.querySelector('.val');
+  const show = (dv, tag) => { val.textContent = `${tag}: ${hex(dv)}  |${ascii(dv)}|`; log(`  ${tag} ${c.uuid}: ${hex(dv)} |${ascii(dv)}|`); };
+
+  if (c.properties.read) {
+    const b = button('Read', async () => show(await c.readValue(), 'read'));
+    row.appendChild(b);
+    c.readValue().then(dv => show(dv, 'read')).catch(e => log(`  read ${c.uuid} failed: ${describeErr(e)}`));
+  }
+  if (c.properties.notify || c.properties.indicate) {
+    row.appendChild(button('Subscribe', async () => {
+      c.addEventListener('characteristicvaluechanged', ev => show(ev.target.value, 'notify'));
+      await c.startNotifications();
+      log(`  subscribed ${c.uuid}`);
+    }));
+  }
+  if (c.properties.write || c.properties.writeWithoutResponse) {
+    const input = document.createElement('input');
+    input.placeholder = 'hex, e.g. fd 03 00 ...';
+    row.appendChild(input);
+    row.appendChild(button('Write', async () => {
+      const bytes = parseHex(input.value);
+      if (c.properties.write) await c.writeValueWithResponse(bytes); else await c.writeValueWithoutResponse(bytes);
+      log(`  wrote ${c.uuid}: ${input.value}`);
+    }));
+  }
+  box.appendChild(el);
+}
+
+function button(label, fn) {
+  const b = document.createElement('button');
+  b.textContent = label;
+  b.onclick = async () => { try { await fn(); } catch (e) { log(`  ${label} failed: ${describeErr(e)}`); } };
+  return b;
+}
+
+$('scan').onclick = scan;
+$('listen').onclick = () => listen().catch(e => log('Listen failed: ' + describeErr(e)));
+document.querySelectorAll('#ctl [data-fmt]').forEach(b => {
+  b.onclick = () => sendNoise(b.dataset.fmt, Number(b.dataset.mode));
+});
+$('disconnect').onclick = () => device?.gatt?.disconnect();
+$('copy').onclick = async () => {
+  const text = report.join('\n') || 'No data yet';
+  try { await navigator.clipboard.writeText(text); log('Report copied'); }
+  catch { prompt('Copy this report:', text); }
+};
+log('Ready. Web Bluetooth: ' + (navigator.bluetooth ? 'yes' : 'NO'));
+</script>
+</body>
+</html>

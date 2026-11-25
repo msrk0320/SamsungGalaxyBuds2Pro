@@ -121,6 +121,26 @@
     </div>
 
     <div class="card">
+      <h2>Sound balance</h2>
+      <div class="d">1. Play a test tone. 2. Move the slider until both sides sound equally loud.</div>
+      <div class="seg" id="tones" style="margin-top:10px">
+        <button data-pan="-1">Left</button>
+        <button data-pan="0">Both</button>
+        <button data-pan="1">Right</button>
+      </div>
+      <div style="margin-top:14px">
+        <div class="row" style="padding-bottom:0">
+          <div class="t">Balance<div class="d" id="balTxt">Centre</div></div>
+          <button id="balReset" class="ghost">Centre</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="d">L</span><input type="range" id="bal" min="0" max="32" step="1" value="16"><span class="d">R</span>
+        </div>
+      </div>
+      <div class="d" style="margin-top:8px">Saved on the Buds. Still uneven at the ends? Clean the ear tip mesh, check the tip size, and check iPhone Settings › Accessibility › Audio &amp; Visual › Balance.</div>
+    </div>
+
+    <div class="card">
       <h2>Touch controls</h2>
       <div class="row">
         <div class="t">Touch controls enabled<div class="d">Turn off to lock the touchpads</div></div>
@@ -193,7 +213,7 @@ const normUuid = u => /^[0-9a-f]{4}$/i.test(String(u)) ? `0000${String(u).toLowe
 const ID = {
   ACK: 0x42, STATUS: 0x60, EXT_STATUS: 0x61, NOISE_UPDATE: 0x77, NOISE: 0x78,
   ANC_ONE: 0x6f, DETECT: 0x7a, DETECT_DUR: 0x7b, AMB_VOL: 0x84,
-  EQ: 0x86, MANAGER_INFO: 0x88, SIDETONE: 0x8b, LOCK: 0x90, TOUCH_OPT: 0x92,
+  EQ: 0x86, MANAGER_INFO: 0x88, SIDETONE: 0x8b, BALANCE: 0x8f, LOCK: 0x90, TOUCH_OPT: 0x92,
   EDGE: 0x95, FIND_START: 0xa0, FIND_STOP: 0xa1, SEAMLESS: 0xaf,
 };
 const NAMES = Object.fromEntries(Object.entries(ID).map(([k, v]) => [v, k]));
@@ -340,6 +360,7 @@ function showExtStatus(p) {
   selectNoise(p[12]);
   $('seamless').checked = p[19] === 0;
   $('ambVol').value = String(Math.min(p[23], 2));
+  showBalance(Math.min(p[25], 32));
   $('detect').checked = p[26] === 1;
   $('detectDur').value = String(p[27] > 2 ? 1 : p[27]);
   $('ancOne').checked = p[28] === 1;
@@ -509,6 +530,50 @@ $('touch').onchange = e => {
 const sendTouchOpts = () => send(ID.TOUCH_OPT, [Number($('holdL').value), Number($('holdR').value)]);
 $('holdL').onchange = sendTouchOpts;
 $('holdR').onchange = sendTouchOpts;
+
+// ---- Balance: 0 = all left, 16 = centre, 32 = all right (GalaxyBudsClient: SET_HEARING_ENHANCEMENTS) ----
+function showBalance(v) {
+  $('bal').value = String(v);
+  const r = Math.round(v / 32 * 100);
+  $('balTxt').textContent = v === 16 ? 'Centre' : `Left ${100 - r}% · Right ${r}%`;
+}
+$('bal').oninput = e => { const v = Number(e.target.value); showBalance(v); send(ID.BALANCE, [v], `BALANCE ${v}`); };
+$('balReset').onclick = () => { showBalance(16); send(ID.BALANCE, [16], 'BALANCE 16'); };
+
+// Test tone: soft 1 kHz-ish pulses on one side, so a weak side is easy to hear.
+let actx = null, tone = null;
+function stopTone() {
+  if (tone) { try { tone.osc.stop(); } catch { /* already stopped */ } tone = null; }
+  document.querySelectorAll('#tones button').forEach(b => b.classList.remove('sel'));
+}
+function playTone(pan, btn) {
+  stopTone();
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch { /* old iOS */ } // play even on silent mode
+  actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+  actx.resume();
+  const osc = actx.createOscillator(), gain = actx.createGain(), lfo = actx.createOscillator(), depth = actx.createGain();
+  osc.frequency.value = 1000;
+  gain.gain.value = 0.12;
+  lfo.frequency.value = 2; depth.gain.value = 0.1; // gentle pulse, easier to judge than a flat beep
+  lfo.connect(depth).connect(gain.gain);
+  let out = gain;
+  if (actx.createStereoPanner) { const p = actx.createStereoPanner(); p.pan.value = pan; gain.connect(p); out = p; }
+  else { // older WebKit: split into channels by hand
+    const m = actx.createChannelMerger(2);
+    if (pan <= 0) gain.connect(m, 0, 0);
+    if (pan >= 0) gain.connect(m, 0, 1);
+    out = m;
+  }
+  osc.connect(gain); out.connect(actx.destination);
+  osc.start(); lfo.start();
+  osc.onended = () => lfo.stop();
+  tone = { osc };
+  btn.classList.add('sel');
+}
+document.querySelectorAll('#tones button').forEach(b => b.onclick = () => {
+  if (b.classList.contains('sel')) stopTone(); else playTone(Number(b.dataset.pan), b);
+});
+document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') stopTone(); });
 
 function setFinding(on) {
   finding = on;

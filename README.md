@@ -9,6 +9,7 @@ Control Galaxy Buds2 Pro from an iPhone with no Samsung app and no App Store ins
 - Battery: left, right, case, wear and charging state
 - Noise controls: Off / ANC / Ambient, ambient level, voice detect, ANC with one earbud
 - Equalizer presets
+- Left/right sound balance with left, right and both test tones
 - Touch lock, touch-and-hold action per side, double-tap edge for volume
 - Find my Buds
 - Seamless connection, ambient sound during calls, 360 Audio
